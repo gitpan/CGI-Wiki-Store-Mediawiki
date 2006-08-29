@@ -1,10 +1,10 @@
 ---
 name: CGI-Wiki-Store-Mediawiki
 version: !!perl/hash:Module::Build::Version
-  original: 0.01
+  original: 0.02
   version:
     - 0
-    - 10
+    - 20
 author:
   - 'Derek Price <derek@ximbiot.com>'
 abstract: Mediawiki (MySQL) storage backend for CGI::Wiki
@@ -21,7 +21,7 @@ build_requires:
 provides:
   CGI::Wiki::Store::Mediawiki:
     file: lib/CGI/Wiki/Store/Mediawiki.pm
-    version: 0.01
+    version: 0.02
 generated_by: Module::Build version 0.2804
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.2.html

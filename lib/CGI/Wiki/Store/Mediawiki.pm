@@ -20,11 +20,11 @@ CGI::Wiki::Store::Mediawiki - Mediawiki (MySQL) storage backend for CGI::Wiki
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 =head1 REQUIRES
 
@@ -32,10 +32,13 @@ Subclasses CGI::Wiki::Store::Database.
 
 =head1 SYNOPSIS
 
-Implementation of CGI::Wiki::Store::Database which reads and writes to a
+Implementation of L<CGI::Wiki::Store::Database> which reads and writes to a
 Mediawiki 1.6 database running in MySQL.
 
-See CGI::Wiki::Store::Database for more.
+All date and time values are returned as L<Time::Piece::Adaptive> objects.
+This should be transparent for most uses.
+
+See L<CGI::Wiki::Store::Database> for more.
 
 =cut
 
@@ -206,14 +209,12 @@ sub __num_to_namespace
 
 # turn the CGI::Wiki metadata fields of a search into a metadata hash
 # substructure.
-my @metadata_fields = qw{edit_type username comment};
+my @metadata_fields = qw{comment edit_type patrolled username};
 sub _make_metadata
 {
     my $data = shift;
     my %metadata;
-    @metadata{@metadata_fields} = map {
-	[$data->{$_}];
-    } @$data{@metadata_fields};
+    @metadata{@metadata_fields} = map { [$_] } @$data{@metadata_fields};
     $data->{metadata} = \%metadata;
 }
 
@@ -331,16 +332,34 @@ sub _retrieve_node_content
 
 =head2 list_all_nodes
 
-Like the parent function.
+Like the parent function, but accepts limit & offset arguments.
 
 =cut
 
 sub list_all_nodes
 {
-    my $self = shift;
+    my ($self, %args) = @_;
     my $dbh = $self->dbh;
-    my $sql = "SELECT page_namespace, page_title FROM page;";
+
+    my $fields;
+    if (wantarray)
+    {
+	$fields = "page_namespace, page_title";
+    }
+    else
+    {
+	$fields = "COUNT(*)";
+    }
+
+    my $sql = "SELECT $fields FROM page";
+    my $limoffsql = _get_lim_off_sql (%args);
+    $sql .= " " . $limoffsql if $limoffsql;
+
     my $nodes = $dbh->selectall_arrayref ($sql); 
+
+    print STDERR "executing $sql\n"; # if $self->{debug};
+    return $nodes->[0]->[0] unless wantarray;
+
     return map {
 	$self->__num_to_namespace ($_->[0], $self->charset_decode ($_->[1]))
     } @$nodes;
@@ -362,7 +381,7 @@ sub list_recent_changes
     my $self = shift;
     my %args = @_;
 
-    my $exclusive;
+    my $exclusive = 0;
     foreach my $option (qw{days since between_days between_secs})
     {
 	$exclusive++ if $args{$option};
@@ -459,12 +478,36 @@ sub _get_metadata_sql
 
 
 
+sub _get_lim_off_sql
+{
+    my (%args) = @_;
+
+    if (exists $args{limit})
+    {
+	croak "Bad argument limit=`$args{limit}'"
+	    unless defined $args{limit} && $args{limit} =~ /^\d+$/;
+    }
+    if (exists $args{offset})
+    {
+	croak "Bad argument offset=`$args{offset}'"
+	    unless defined $args{offset} && $args{offset} =~ /^\d+$/;
+
+	# This number is big.
+	$args{limit} = 18446744073709551615 unless defined $args{limit};
+    }
+
+    return (defined $args{limit} ? "LIMIT $args{limit}" : "")
+	   . ($args{offset} ? " OFFSET $args{offset}" : "");
+}
+
+
+
 sub _find_recent_changes_by_criteria
 {
     my ($self, %args) = @_;
-    my ($since, $limit, $offset, $between_days, $include_all_changes,
+    my ($since, $between_days, $include_all_changes,
         $metadata_is,  $metadata_isnt, $metadata_was, $metadata_wasnt) =
-         @args{qw(since limit offset between_days include_all_changes
+         @args{qw(since between_days include_all_changes
                   metadata_is metadata_isnt metadata_was metadata_wasnt)};
     my $dbh = $self->dbh;
     my $sql;
@@ -488,12 +531,13 @@ sub _find_recent_changes_by_criteria
     # including history is selected, regardless of the value of
     # include_all_changes.
     #
-    # It seems to me like it would be easier to just accept one metadata
-    # argument and let include_all_changes switch tables, but I am implementing
-    # this anyway for backwards compatibility.
+    # It seems to me like it would be easier to just accept two metadata
+    # arguments and let include_all_changes switch tables, but I am
+    # implementing this anyway for backwards compatibility.
     if ($include_all_changes || (!($metadata_is || $metadata_isnt)
 				 && ($metadata_was || $metadata_wasnt)))
     {
+	$include_all_changes = 1;
 	$tables = "text LEFT JOIN recentchanges ON rc_this_oldid = old_id";
 	$table_prefix = "old_";
 	$metadata_is = $metadata_was unless $metadata_is;
@@ -501,9 +545,12 @@ sub _find_recent_changes_by_criteria
     }
     else
     {
-	$tables = "cur, page";
+	$tables = "cur INNER JOIN page ON page_namespace = cur_namespace"
+		. " AND page_title = cur_title"
+		. " LEFT JOIN recentchanges ON rc_this_oldid = page_latest";
 	$table_prefix = "cur_";
     }
+
 
     if (wantarray)
     {
@@ -521,6 +568,10 @@ sub _find_recent_changes_by_criteria
 				       minor_edit};
 	@outfields = qw{version is_new username comment last_modified
 			edit_type};
+
+	$infields .= ", rc_patrolled";
+	push @outfields, 'patrolled';
+
 	unless ($args{name} && !$ignore_case)
 	{
 	    $infields .= ", " . join ", ", map {$table_prefix . $_}
@@ -536,15 +587,7 @@ sub _find_recent_changes_by_criteria
     $sql = "SELECT $infields"
 	   . " FROM $tables";
 
-    if ($include_all_changes)
-    {
-	$sql .= " WHERE 1 = 1";
-    }
-    else
-    {
-	$sql .= " WHERE page_namespace = cur_namespace"
-		. " AND page_title = cur_title";
-    }
+    $sql .= " WHERE 1 = 1";
 
     $sql .= " AND " . $table_prefix . "namespace = $ns"
             . " AND "
@@ -572,14 +615,8 @@ sub _find_recent_changes_by_criteria
 
     $sql .= " ORDER BY " . $table_prefix . "timestamp DESC";
 
-    if ($limit || $offset) {
-	$limit ||= 0;
-	$offset ||= 0;
-        croak "Bad argument limit=$limit" unless $limit =~ /^\d+$/;
-        croak "Bad argument offset=$offset" unless $offset =~ /^\d+$/;
-        $sql .= " LIMIT $limit";
-        $sql .= " OFFSET $offset" if $offset;
-    }
+    my $limoffsql = _get_lim_off_sql (%args);
+    $sql .= " " . $limoffsql if $limoffsql;
 
     print STDERR "executing $sql\n"; # if $self->{debug};
     my $nodes = $dbh->selectall_arrayref ($sql);
@@ -591,9 +628,12 @@ sub _find_recent_changes_by_criteria
     {
 	my %node;
 	@node{@outfields} = @{$nodes->[$i]};
-	if ($args{name} && !$ignore_case) {
+	if ($args{name} && !$ignore_case)
+	{
 	    $node{name} = $args{name};
-	} else {
+	}
+	else
+	{
 	    $node{name} =
 		$self->__num_to_namespace ($node{ns},
 					   $self->charset_decode ($node{name}));
@@ -604,162 +644,6 @@ sub _find_recent_changes_by_criteria
 	push @newnodes, \%node;
     }
     return @newnodes;
-}
-sub _find_recent_changes_by_criteria_old {
-    my ($self, %args) = @_;
-    my ($since, $limit, $between_days,
-        $metadata_is,  $metadata_isnt, $metadata_was, $metadata_wasnt) =
-         @args{qw(since limit between_days
-                  metadata_is metadata_isnt metadata_was metadata_wasnt)};
-    my $ignore_case;
-    my $dbh = $self->dbh;
-
-    my @where;
-    my @metadata_joins;
-    my $main_table = $args{include_all_changes} ? "text" : "cur";
-    my $table_prefix = $args{include_all_changes} ? "old_" : "cur_";
-    if ($metadata_is || $metadata_isnt) {
-        if ($metadata_is) {
-            my $i = 0;
-            foreach my $type (keys %$metadata_is) {
-                $i++;
-                my $value  = $metadata_is->{$type};
-                croak "metadata_is must have scalar values" if ref $value;
-                my $mdt = "md_is_$i";
-                push @metadata_joins, "LEFT JOIN metadata AS $mdt
-                                 ON $main_table.name=$mdt.node
-                                 AND $main_table.version=$mdt.version\n";
-                push @where, "( "
-                         . $self->_get_comparison_sql(
-                                          thing1      => "$mdt.metadata_type",
-                                          thing2      => $dbh->quote($type),
-                                          ignore_case => $ignore_case,
-                                                     )
-                         . " AND "
-                         . $self->_get_comparison_sql(
-                                          thing1      => "$mdt.metadata_value",
-                                          thing2      => $dbh->quote($value),
-                                          ignore_case => $ignore_case,
-                                                     )
-                         . " )";
-	    }
-	}
-        if ( $metadata_isnt ) {
-            foreach my $type ( keys %$metadata_isnt ) {
-                my $value  = $metadata_isnt->{$type};
-                croak "metadata_isnt must have scalar values" if ref $value;
-	    }
-            my @omits = $self->_find_recent_changes_by_criteria(
-                since        => $since,
-                between_days => $between_days,
-                metadata_is  => $metadata_isnt,
-                ignore_case  => $ignore_case,
-            );
-            foreach my $omit ( @omits ) {
-                push @where, "( node.name != " . $dbh->quote($omit->{name})
-                     . "  OR node.version != " . $dbh->quote($omit->{version})
-                     . ")";
-	    }
-	}
-    } else {
-        if ( $metadata_was ) {
-            $main_table = "content";
-            my $i = 0;
-            foreach my $type ( keys %$metadata_was ) {
-                $i++;
-                my $value  = $metadata_was->{$type};
-                croak "metadata_was must have scalar values" if ref $value;
-                my $mdt = "md_was_$i";
-                push @metadata_joins, "LEFT JOIN metadata AS $mdt
-                                 ON $main_table.name=$mdt.node
-                                 AND $main_table.version=$mdt.version\n";
-                push @where, "( "
-                         . $self->_get_comparison_sql(
-                                          thing1      => "$mdt.metadata_type",
-                                          thing2      => $dbh->quote($type),
-                                          ignore_case => $ignore_case,
-                                                     )
-                         . " AND "
-                         . $self->_get_comparison_sql(
-                                          thing1      => "$mdt.metadata_value",
-                                          thing2      => $dbh->quote($value),
-                                          ignore_case => $ignore_case,
-                                                     )
-                         . " )";
-	    }
-	}
-        if ( $metadata_wasnt ) {
-            $main_table = "content";
-            foreach my $type ( keys %$metadata_wasnt ) {
-                my $value  = $metadata_was->{$type};
-                croak "metadata_was must have scalar values" if ref $value;
-	    }
-            my @omits = $self->_find_recent_changes_by_criteria(
-                since        => $since,
-                between_days => $between_days,
-                metadata_was => $metadata_wasnt,
-                ignore_case  => $ignore_case,
-            );
-            foreach my $omit ( @omits ) {
-                push @where, "( content.name != " . $dbh->quote($omit->{name})
-                 . "  OR content.version != " . $dbh->quote($omit->{version})
-                 . ")";
-	    }
-	}
-    }
-
-    if ( $since ) {
-        my $timestamp = $self->_get_timestamp( $since );
-        push @where, "$main_table.modified >= " . $dbh->quote($timestamp);
-    } elsif ( $between_days ) {
-        my $now = localtime;
-        # Start is the larger number of days ago.
-        my ($start, $end) = @$between_days;
-        ($start, $end) = ($end, $start) if $start < $end;
-        my $ts_start = $self->_get_timestamp( $now - (ONE_DAY * $start) ); 
-        my $ts_end = $self->_get_timestamp( $now - (ONE_DAY * $end) ); 
-        push @where, "$main_table.modified >= " . $dbh->quote($ts_start);
-        push @where, "$main_table.modified <= " . $dbh->quote($ts_end);
-    }
-
-    my $sql = "SELECT DISTINCT
-                               $main_table.name,
-                               $main_table.version,
-                               $main_table.modified
-               FROM $main_table
-              "
-            . join("\n", @metadata_joins)
-            . (
-                scalar @where
-                              ? " WHERE " . join(" AND ",@where) 
-                              : ""
-              )
-            . " ORDER BY $main_table.modified DESC";
-    if ( $limit ) {
-        croak "Bad argument $limit" unless $limit =~ /^\d+$/;
-        $sql .= " LIMIT $limit";
-    }
-#print "\n\n$sql\n\n";
-    my $nodesref = $dbh->selectall_arrayref($sql);
-    my @finds = map { { name          => $_->[0],
-			version       => $_->[1],
-			last_modified => $_->[2] }
-		    } @$nodesref;
-    foreach my $find ( @finds ) {
-        my %metadata;
-        my $sth = $dbh->prepare( "SELECT metadata_type, metadata_value
-                                  FROM metadata WHERE node=? AND version=?" );
-        $sth->execute( $find->{name}, $find->{version} );
-        while ( my ($type, $value) = $self->charset_decode( $sth->fetchrow_array ) ) {
-	    if ( defined $metadata{$type} ) {
-                push @{$metadata{$type}}, $value;
-	    } else {
-                $metadata{$type} = [ $value ];
-            }
-	}
-        $find->{metadata} = \%metadata;
-    }
-    return @finds;
 }
 
 
@@ -1230,9 +1114,139 @@ sub node_exists
 
 
 
+=head2 list_backlinks
+
+  # List all nodes that link to the Home Page.
+  my @links = $store->list_backlinks (node => "Home Page");
+
+=cut
+
+sub list_backlinks
+{
+    my ($self, %args) = @_;
+    my $node = $args{node};
+    croak "Must supply a node name" unless $node;
+
+    my ($ns, $name) = $self->__namespace_to_num ($node);
+    my $dbh = $self->dbh;
+
+    my $fields = "DISTINCT page_namespace, page_title";
+    $fields = "COUNT($fields)" unless wantarray;
+
+    my $sql = "SELECT $fields"
+	      . " FROM page p, pagelinks pl"
+	      . " WHERE pl_namespace = $ns"
+	      . " AND "
+	      . $self->_get_cmp_sql ("pl_title",
+				     $self->charset_encode ($name),
+				     $args{ignore_case})
+	      . " AND page_id = pl_from";
+
+    my $limoffsql = _get_lim_off_sql (%args);
+    $sql .= " " . $limoffsql if $limoffsql;
+
+    print STDERR "executing $sql\n"; # if $self->{debug};
+    my $sth = $dbh->prepare ($sql);
+    $sth->execute or croak $dbh->errstr;
+
+    return ($sth->fetchrow_array)[0] unless wantarray;
+
+    my @backlinks;
+    while (my ($ns_from, $from) = $sth->fetchrow_array)
+    {
+	push @backlinks,
+	     $self->__num_to_namespace ($ns_from,
+					$self->charset_decode ($from));
+    }
+    return @backlinks;
+}
+
+
+
+=head2 list_dangling_links
+
+  # List all nodes that have been linked to from other nodes but don't
+  # yet exist.
+  my @links = $store->list_dangling_links;
+
+Each node is returned once only, regardless of how many other nodes
+link to it.  Nodes are be returned unsorted.
+
+=cut
+
+sub list_dangling_links
+{
+    my $self = shift;
+    my $dbh = $self->dbh;
+    my $sql = "SELECT DISTINCT bl_to FROM brokenlinks";
+    my $sth = $dbh->prepare ($sql);
+    print STDERR "executing $sql\n"; # if $self->{debug};
+    $sth->execute or croak $dbh->errstr;
+    my @links;
+    while (my ($link) = $self->charset_decode ($sth->fetchrow_array))
+    {
+        push @links, $link;
+    }
+    return @links;
+}
+
+
+
+=head2 list_dangling_links_w_count
+
+  # List all nodes that have been linked to from other nodes but don't
+  # yet exist, with a reference count.
+  foreach my $link ($store->list_dangling_links_w_count)
+  {
+    print "Missing `", $link->[0], "' has ", $link->[1], " references.\n";
+  }
+
+Nodes are returned sorted primarily by the reference count, greatest first, and
+secondarily in alphabetical order.
+
+=cut
+
+sub list_dangling_links_w_count
+{
+    my ($self, %args) = @_;
+    my $dbh = $self->dbh;
+    my ($fields, $tail);
+
+    if (wantarray)
+    {
+	$fields = "bl_to, COUNT(*)";
+	$tail = "GROUP BY bl_to ORDER BY COUNT(*) DESC, bl_to";
+    }
+    else
+    {
+	$fields = "COUNT(DISTINCT bl_to)";
+    }
+
+    my $limoffsql = _get_lim_off_sql (%args);
+    $tail .= ($tail ? " " : "") . $limoffsql if $limoffsql;
+
+    my $sql = "SELECT $fields FROM brokenlinks";
+    $sql .= " " . $tail if $tail;
+
+    print STDERR "executing $sql\n"; # if $self->{debug};
+    my $sth = $dbh->prepare ($sql);
+    $sth->execute or croak $dbh->errstr;
+
+    return ($sth->fetchrow_array)[0] unless wantarray;
+
+    my @links;
+    while (my @row = $sth->fetchrow_array)
+    {
+        push @links, [$self->charset_decode ($row[0]), $row[1]];
+    }
+    return @links;
+}
+
+
+
 =head2 validate_user
 
-  $store->validate_user ($username, $password, %other_args);
+  my $username = $store->validate_user ($username, $password, %other_args);
 
 Given a username and a password, return the username if it exists and password
 is correct, or undef, otherwise.
@@ -1273,6 +1287,91 @@ sub validate_user
 }
 
 
+
+=head2 create_new_user
+
+  my $errmsg = $store->create_new_user (name => $username, password => $p);
+
+Create a new user.  C<name> and C<password> are required arguments.
+Optional arguments are C<email> & C<real_name>.
+
+Returns a potentially empty list of error messages.
+
+=cut
+
+sub create_new_user
+{
+    my ($self, %args) = @_;
+    my @errors;
+
+    croak "name & password are required arguments"
+	unless $args{name} && $args{password};
+
+    my $dbh = $self->{_dbh};
+
+    # Verify that the user does not exist.
+    my $sql = "SELECT user_name FROM user"
+	       . " WHERE "
+	       . $self->_get_cmp_sql ("user_name",
+				      $self->charset_encode ($args{name}),
+				      $args{ignore_case});
+    print STDERR "executing $sql\n"; # if $self->{debug};
+    my $userinfo = $dbh->selectall_arrayref ($sql)
+	or croak "Error retrieving user info: " . $dbh->errstr;
+
+    # Check that one and only one user was found.
+    if (@$userinfo)
+    {
+	push @errors, "User `" . $userinfo->[0]->[0] . "' already exists.";
+	return @errors;
+    }
+
+    # Insert the new entry.
+    my (@fields, @values);
+    for my $field (qw{name real_name email})
+    {
+	if (exists $args{$field})
+	{
+	    push @fields, "user_$field";
+	    push @values, $dbh->quote ($self->charset_encode ($args{$field}));
+	}
+    }
+    $sql = "INSERT INTO user (" . join (", ", @fields)
+	   . ") VALUES (" . join (", ", @values) . ")";
+    print STDERR "executing $sql\n"; # if $self->{debug};
+    $dbh->do ($sql) or croak "Error updating database: " . $dbh->errstr;
+
+    # Get the new user ID and update the password.
+    my $new_uid = $dbh->last_insert_id (undef, undef, undef, undef)
+	or croak "Error retrieving last insert id: " . $dbh->errstr;
+
+    # Encode the password.
+    my $ep = md5_hex ($new_uid . "-" . md5_hex ($args{password}));
+
+    # Update the password.
+    $sql = "UPDATE user SET user_password = " . $dbh->quote ($ep)
+	   . " WHERE user_id = $new_uid";
+    print STDERR "executing $sql\n"; # if $self->{debug};
+    $dbh->do ($sql) or croak "Error updating database: " . $dbh->errstr;
+
+    return @errors;
+}
+
+
+
+=head1 SEE ALSO
+
+=over 4
+
+=item L<CGI::Wiki>
+
+=item L<CGI::Wiki::Store::Database>
+
+=item L<CGI::Wiki::Store::MySQL>
+
+=item L<Time::Piece::Adaptive>
+
+=back
 
 =head1 AUTHOR
 
